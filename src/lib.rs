@@ -4,26 +4,25 @@
 extern crate combine;
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
 #[derive(Clone)]
-pub enum Ast {
-    Lit(Value),
-    Variable(String),
-    Call(Box<Ast>, Vec<Ast>),
-    Define(String, Box<Ast>),
+pub enum Ast<'a> {
+    Lit(Value<'a>),
+    Variable(&'a str),
+    Call(Box<Ast<'a>>, Vec<Ast<'a>>),
+    Define(&'a str, Box<Ast<'a>>),
 }
 
 #[derive(Clone)]
-pub enum Value {
+pub enum Value<'a> {
     Void,
     False,
     Int(u64),
-    Function(Vec<String>, Vec<Ast>),
-    InbuiltFunc(fn(Vec<Value>) -> Value),
+    Function(Vec<&'a str>, Vec<Ast<'a>>),
+    InbuiltFunc(fn(Vec<Value<'a>>) -> Value<'a>),
 }
 
-impl PartialEq for Value {
+impl<'a> PartialEq for Value<'a> {
     fn eq(&self, other: &Self) -> bool {
         use Value::*;
 
@@ -36,7 +35,7 @@ impl PartialEq for Value {
     }
 }
 
-pub fn eval(program: Ast, variables: &mut HashMap<Rc<str>, Value>) -> Value {
+pub fn eval<'a>(program: Ast<'a>, variables: &mut HashMap<&'a str, Value<'a>>) -> Value<'a> {
     use self::Ast::*;
     use self::Value::*;
 
@@ -61,7 +60,7 @@ pub fn eval(program: Ast, variables: &mut HashMap<Rc<str>, Value>) -> Value {
 
                     for (name, val) in args.into_iter().zip(arguments) {
                         let val = eval(val, variables);
-                        new_scope.insert(name.into(), val);
+                        new_scope.insert(name, val);
                     }
 
                     let mut out = Void;
@@ -92,8 +91,12 @@ pub fn eval(program: Ast, variables: &mut HashMap<Rc<str>, Value>) -> Value {
 }
 
 parser! {
-    pub fn expr[I]()(I) -> Ast where [I: combine::Stream<Item = char>] {
+    pub fn expr['a, I]()(I) -> Ast<'a> where [
+        I: combine::Stream<Item = char, Range = &'a str> +
+        combine::RangeStreamOnce
+    ] {
         use combine::parser::char::*;
+        use combine::parser::range::*;
         use combine::*;
 
         macro_rules! white {
@@ -109,7 +112,7 @@ parser! {
         let lambda = char('\\');
         let eq = char('=');
         let flse = white!(string("#f")).map(|_| Ast::Lit(::Value::False));
-        let ident = || white!(many1::<String, _>(letter()));
+        let ident = || white!(take_while1(|c: char| c.is_alphabetic()));
         let function = (
             white!(lambda),
             white!(between(char('('), char(')'), many::<Vec<_>, _>(ident()))),
@@ -139,14 +142,12 @@ mod benches {
 
     use super::{eval, expr, Value};
 
-    use std::rc::Rc;
-
     // First we need some helper functions. These are used with the `InbuiltFunc`
     // constructor and act as native functions, similar to how you'd add functions
     // to the global namespace in Lua.
     //
     // This one simply sums the arguments.
-    fn add(variables: Vec<Value>) -> Value {
+    fn add<'a>(variables: Vec<Value<'a>>) -> Value<'a> {
         let mut out = 0u64;
 
         for v in variables {
@@ -162,7 +163,7 @@ mod benches {
     // This one checks the arguments for equality. I used `Void` to represent true
     // and `False` to represent false. This is mostly inspired by scheme, where
     // everything is true except for `#f`.
-    fn eq(mut variables: Vec<Value>) -> Value {
+    fn eq<'a>(mut variables: Vec<Value<'a>>) -> Value<'a> {
         if let Some(last) = variables.pop() {
             for v in variables {
                 if v != last {
@@ -180,7 +181,7 @@ mod benches {
     // other programming language in existence. To do lazy evaluation you make
     // the `then` and `else` branches return functions and then call the
     // functions.
-    fn if_(variables: Vec<Value>) -> Value {
+    fn if_<'a>(variables: Vec<Value<'a>>) -> Value<'a> {
         let mut iter = variables.into_iter();
         let (first, second, third) = (
             iter.next().expect("No condition for if"),
@@ -348,11 +349,11 @@ someval
         // it just returns itself. We try to do as little work as
         // possible here so that our benchmark is still testing the
         // interpreter and not this function.
-        fn callable(_: Vec<Value>) -> Value {
+        fn callable<'a>(_: Vec<Value<'a>>) -> Value<'a> {
             Value::InbuiltFunc(callable)
         }
 
-        let mut env: HashMap<Rc<str>, Value> = HashMap::new();
+        let mut env: HashMap<&str, Value> = HashMap::new();
         env.insert("test".into(), Value::InbuiltFunc(callable));
 
         let (program, _) = expr().easy_parse(DEEP_NESTING).unwrap();
@@ -364,7 +365,7 @@ someval
     fn run_real_code(b: &mut Bencher) {
         use std::collections::HashMap;
 
-        let mut env: HashMap<Rc<str>, Value> = HashMap::new();
+        let mut env: HashMap<&str, Value> = HashMap::new();
 
         env.insert("eq".into(), Value::InbuiltFunc(eq));
         env.insert("add".into(), Value::InbuiltFunc(add));
@@ -391,15 +392,15 @@ someval
         // but we don't want that function to do anything useful
         // since, again, the benchmark should be of the
         // interpreter's code.
-        fn ignore(_: Vec<Value>) -> Value {
+        fn ignore<'a>(_: Vec<Value<'a>>) -> Value<'static> {
             Value::Void
         }
 
         let (program, _) = expr().easy_parse(MANY_VARIABLES).unwrap();
 
-        let mut env: HashMap<Rc<str>, Value> = HashMap::new();
+        let mut env: HashMap<&str, Value> = HashMap::new();
 
-        env.insert("ignore".into(), Value::InbuiltFunc(ignore));
+        env.insert("ignore", Value::InbuiltFunc(ignore));
 
         b.iter(|| black_box(eval(program.clone(), &mut env)));
     }
