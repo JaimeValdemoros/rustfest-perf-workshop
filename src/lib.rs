@@ -2,9 +2,9 @@
 
 #[macro_use]
 extern crate combine;
-extern crate fxhash;
+extern crate fnv;
 
-use fxhash::FxHashMap as HashMap;
+use fnv::FnvHashMap as HashMap;
 //use std::collections::HashMap;
 use std::borrow::Cow;
 use std::rc::Rc;
