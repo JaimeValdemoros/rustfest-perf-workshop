@@ -5,6 +5,7 @@ extern crate combine;
 
 use std::collections::HashMap;
 use std::borrow::Cow;
+use std::rc::Rc;
 
 #[derive(Clone)]
 pub enum Ast<'a> {
@@ -19,8 +20,8 @@ pub enum Value<'a> {
     Void,
     False,
     Int(u64),
-    Function(Vec<&'a str>, Vec<Ast<'a>>),
-    InbuiltFunc(fn(Vec<&Value<'a>>) -> Value<'a>),
+    Function(Rc<[&'a str]>, Rc<[Ast<'a>]>),
+    InbuiltFunc(fn(&[&Value<'a>]) -> Value<'a>),
 }
 
 impl<'a> PartialEq for Value<'a> {
@@ -66,7 +67,7 @@ pub fn eval<'a, 'b>(program: &'b Ast<'a>, variables: &mut HashMap<&'a str, Cow<'
 
                     let mut out = Cow::Owned(Void);
 
-                    for stmt in body {
+                    for stmt in body.iter() {
                         out = eval(&stmt, &mut new_scope);
                     }
 
@@ -78,7 +79,9 @@ pub fn eval<'a, 'b>(program: &'b Ast<'a>, variables: &mut HashMap<&'a str, Cow<'
                             .map(|ast| eval(ast, variables))
                             .collect::<Vec<_>>();
 
-                    let res = func(args.iter().map(|v| v.as_ref()).collect());
+                    let arg_refs = args.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
+
+                    let res = func(&arg_refs);
 
                     Cow::Owned(res)
                 },
@@ -122,7 +125,7 @@ parser! {
             white!(lambda),
             white!(between(char('('), char(')'), many::<Vec<_>, _>(ident()))),
             many::<Vec<_>, _>(expr()),
-        ).map(|(_, a, b)| Ast::Lit(::Value::Function(a, b)));
+        ).map(|(_, a, b)| Ast::Lit(::Value::Function(a.into(), b.into())));
         let define = (white!(eq), ident(), expr()).map(|(_, a, b)| Ast::Define(a, Box::new(b)));
         let lit_num = many1::<String, _>(digit())
             .map(|i| Ast::Lit(::Value::Int(i.parse().expect("Parsing integer failed"))));
@@ -154,7 +157,7 @@ mod benches {
     // to the global namespace in Lua.
     //
     // This one simply sums the arguments.
-    fn add<'a>(variables: Vec<&Value<'a>>) -> Value<'a> {
+    fn add<'a>(variables: &[&Value<'a>]) -> Value<'a> {
         let mut out = 0u64;
 
         for v in variables {
@@ -170,9 +173,10 @@ mod benches {
     // This one checks the arguments for equality. I used `Void` to represent true
     // and `False` to represent false. This is mostly inspired by scheme, where
     // everything is true except for `#f`.
-    fn eq<'a>(mut variables: Vec<&Value<'a>>) -> Value<'a> {
-        if let Some(last) = variables.pop() {
-            for v in variables {
+    fn eq<'a>(variables: &[&Value<'a>]) -> Value<'a> {
+        let mut iter_vars = variables.into_iter();
+        if let Some(last) = iter_vars.next() {
+            for v in iter_vars {
                 if v != last {
                     return Value::False;
                 }
@@ -188,20 +192,21 @@ mod benches {
     // other programming language in existence. To do lazy evaluation you make
     // the `then` and `else` branches return functions and then call the
     // functions.
-    fn if_<'a>(variables: Vec<&Value<'a>>) -> Value<'a> {
+    fn if_<'a>(variables: &[&Value<'a>]) -> Value<'a> {
+        use std::ops::Deref;
+
         let mut iter = variables.into_iter();
-        let void = Value::Void;
         let (first, second, third) = (
             iter.next().expect("No condition for if"),
             iter.next().expect("No body for if"),
-            iter.next().unwrap_or(&void),
+            iter.next(),
         );
         assert!(iter.next().is_none(), "Too many arguments supplied to `if`");
 
-        match *first {
-            Value::False => third,
-            _ => second,
-        }.clone()
+        match **first {
+            Value::False => third.map(Deref::deref).cloned().unwrap_or(Value::Void),
+            _ => (*second).clone(),
+        }
     }
 
     // Here are our test program strings. Our language looks a lot like Lisp,
@@ -350,20 +355,19 @@ someval
     // our testing code needs in order to run.
     #[bench]
     fn run_deep_nesting(b: &mut Bencher) {
-        use std::collections::HashMap;
 
         // This just returns a function so `((whatever))` (equivalent
         // to `(whatever())()`) does something useful. Specifically
         // it just returns itself. We try to do as little work as
         // possible here so that our benchmark is still testing the
         // interpreter and not this function.
-        fn callable<'a>(_: Vec<&Value<'a>>) -> Value<'a> {
+        fn callable<'a>(_: &[&Value<'a>]) -> Value<'a> {
             Value::InbuiltFunc(callable)
         }
 
         let (program, _) = expr().easy_parse(DEEP_NESTING).unwrap();
 
-        let mut env = HashMap::new();
+        let mut env = HashMap::default();
         env.insert("test".into(), Cow::Owned(Value::InbuiltFunc(callable)));
 
         b.iter(|| {
@@ -373,9 +377,8 @@ someval
 
     #[bench]
     fn run_real_code(b: &mut Bencher) {
-        use std::collections::HashMap;
 
-        let mut env = HashMap::new();
+        let mut env = HashMap::default();
 
         env.insert("eq".into(), Cow::Owned(Value::InbuiltFunc(eq)));
         env.insert("add".into(), Cow::Owned(Value::InbuiltFunc(add)));
@@ -395,20 +398,19 @@ someval
 
     #[bench]
     fn run_many_variables(b: &mut Bencher) {
-        use std::collections::HashMap;
 
         // This just takes anything and returns `Void`. We just
         // want a function that can take any number of arguments
         // but we don't want that function to do anything useful
         // since, again, the benchmark should be of the
         // interpreter's code.
-        fn ignore<'a>(_: Vec<&Value<'a>>) -> Value<'static> {
+        fn ignore<'a>(_: &[&Value<'a>]) -> Value<'static> {
             Value::Void
         }
 
         let (program, _) = expr().easy_parse(MANY_VARIABLES).unwrap();
 
-        let mut env = HashMap::new();
+        let mut env = HashMap::default();
 
         env.insert("ignore", Cow::Owned(Value::InbuiltFunc(ignore)));
 
@@ -417,10 +419,9 @@ someval
 
     #[bench]
     fn run_nested_func(b: &mut Bencher) {
-        use std::collections::HashMap;
 
         let (program, _) = expr().easy_parse(NESTED_FUNC).unwrap();
-        let mut env = HashMap::new();
+        let mut env = HashMap::default();
         b.iter(|| black_box(eval(&program, &mut env)));
     }
 }
