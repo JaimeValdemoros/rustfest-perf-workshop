@@ -4,6 +4,7 @@
 extern crate combine;
 
 use std::collections::HashMap;
+use std::borrow::Cow;
 
 #[derive(Clone)]
 pub enum Ast<'a> {
@@ -19,7 +20,7 @@ pub enum Value<'a> {
     False,
     Int(u64),
     Function(Vec<&'a str>, Vec<Ast<'a>>),
-    InbuiltFunc(fn(Vec<Value<'a>>) -> Value<'a>),
+    InbuiltFunc(fn(Vec<&Value<'a>>) -> Value<'a>),
 }
 
 impl<'a> PartialEq for Value<'a> {
@@ -35,12 +36,12 @@ impl<'a> PartialEq for Value<'a> {
     }
 }
 
-pub fn eval<'a>(program: &Ast<'a>, variables: &mut HashMap<&'a str, Value<'a>>) -> Value<'a> {
+pub fn eval<'a, 'b>(program: &'b Ast<'a>, variables: &mut HashMap<&'a str, Cow<'b, Value<'a>>>) -> Cow<'b, Value<'a>> {
     use self::Ast::*;
     use self::Value::*;
 
     match *program {
-        Lit(ref val) => val.clone(),
+        Lit(ref val) => Cow::Borrowed(val),
         Variable(ref name) => match variables.get::<str>(name.as_ref()) {
             Some(v) => v.clone(),
             _ => panic!("Variable does not exist: {}", &name),
@@ -48,8 +49,8 @@ pub fn eval<'a>(program: &Ast<'a>, variables: &mut HashMap<&'a str, Value<'a>>) 
         Call(ref func, ref arguments) => {
             let func = eval(&*func, variables);
 
-            match func {
-                Function(args, body) => {
+            match *func.as_ref() {
+                Function(ref args, ref body) => {
                     // Start a new scope, so all variables defined in the body of the
                     // function don't leak into the surrounding scope.
                     let mut new_scope = variables.clone();
@@ -63,20 +64,24 @@ pub fn eval<'a>(program: &Ast<'a>, variables: &mut HashMap<&'a str, Value<'a>>) 
                         new_scope.insert(name, val);
                     }
 
-                    let mut out = Void;
+                    let mut out = Cow::Owned(Void);
 
                     for stmt in body {
                         out = eval(&stmt, &mut new_scope);
                     }
 
-                    out
+                    Cow::Owned(out.into_owned())
                 }
-                InbuiltFunc(func) => func(
-                    arguments
-                        .into_iter()
-                        .map(|ast| eval(&ast, variables))
-                        .collect(),
-                ),
+                InbuiltFunc(ref func) => {
+                    let args = arguments
+                            .iter()
+                            .map(|ast| eval(ast, variables))
+                            .collect::<Vec<_>>();
+
+                    let res = func(args.iter().map(|v| v.as_ref()).collect());
+
+                    Cow::Owned(res)
+                },
                 _ => panic!("Attempted to call a non-function"),
             }
         }
@@ -85,7 +90,7 @@ pub fn eval<'a>(program: &Ast<'a>, variables: &mut HashMap<&'a str, Value<'a>>) 
 
             variables.insert(name, value);
 
-            Void
+            Cow::Owned(Void)
         }
     }
 }
@@ -142,16 +147,18 @@ mod benches {
 
     use super::{eval, expr, Value};
 
+    use std::borrow::Cow;
+
     // First we need some helper functions. These are used with the `InbuiltFunc`
     // constructor and act as native functions, similar to how you'd add functions
     // to the global namespace in Lua.
     //
     // This one simply sums the arguments.
-    fn add<'a>(variables: Vec<Value<'a>>) -> Value<'a> {
+    fn add<'a>(variables: Vec<&Value<'a>>) -> Value<'a> {
         let mut out = 0u64;
 
         for v in variables {
-            match v {
+            match *v {
                 Value::Int(i) => out += i,
                 _ => println!("Tried to add a non-int"),
             }
@@ -163,7 +170,7 @@ mod benches {
     // This one checks the arguments for equality. I used `Void` to represent true
     // and `False` to represent false. This is mostly inspired by scheme, where
     // everything is true except for `#f`.
-    fn eq<'a>(mut variables: Vec<Value<'a>>) -> Value<'a> {
+    fn eq<'a>(mut variables: Vec<&Value<'a>>) -> Value<'a> {
         if let Some(last) = variables.pop() {
             for v in variables {
                 if v != last {
@@ -181,19 +188,20 @@ mod benches {
     // other programming language in existence. To do lazy evaluation you make
     // the `then` and `else` branches return functions and then call the
     // functions.
-    fn if_<'a>(variables: Vec<Value<'a>>) -> Value<'a> {
+    fn if_<'a>(variables: Vec<&Value<'a>>) -> Value<'a> {
         let mut iter = variables.into_iter();
+        let void = Value::Void;
         let (first, second, third) = (
             iter.next().expect("No condition for if"),
             iter.next().expect("No body for if"),
-            iter.next().unwrap_or(Value::Void),
+            iter.next().unwrap_or(&void),
         );
         assert!(iter.next().is_none(), "Too many arguments supplied to `if`");
 
-        match first {
+        match *first {
             Value::False => third,
             _ => second,
-        }
+        }.clone()
     }
 
     // Here are our test program strings. Our language looks a lot like Lisp,
@@ -349,27 +357,29 @@ someval
         // it just returns itself. We try to do as little work as
         // possible here so that our benchmark is still testing the
         // interpreter and not this function.
-        fn callable<'a>(_: Vec<Value<'a>>) -> Value<'a> {
+        fn callable<'a>(_: Vec<&Value<'a>>) -> Value<'a> {
             Value::InbuiltFunc(callable)
         }
 
-        let mut env: HashMap<&str, Value> = HashMap::new();
-        env.insert("test".into(), Value::InbuiltFunc(callable));
-
         let (program, _) = expr().easy_parse(DEEP_NESTING).unwrap();
 
-        b.iter(|| black_box(eval(&program, &mut env)));
+        let mut env = HashMap::new();
+        env.insert("test".into(), Cow::Owned(Value::InbuiltFunc(callable)));
+
+        b.iter(|| {
+            black_box(eval(&program, &mut env))
+        });
     }
 
     #[bench]
     fn run_real_code(b: &mut Bencher) {
         use std::collections::HashMap;
 
-        let mut env: HashMap<&str, Value> = HashMap::new();
+        let mut env = HashMap::new();
 
-        env.insert("eq".into(), Value::InbuiltFunc(eq));
-        env.insert("add".into(), Value::InbuiltFunc(add));
-        env.insert("if".into(), Value::InbuiltFunc(if_));
+        env.insert("eq".into(), Cow::Owned(Value::InbuiltFunc(eq)));
+        env.insert("add".into(), Cow::Owned(Value::InbuiltFunc(add)));
+        env.insert("if".into(), Cow::Owned(Value::InbuiltFunc(if_)));
 
         let (program, _) = ::combine::many1::<Vec<_>, _>(expr())
             .easy_parse(REAL_CODE)
@@ -392,15 +402,15 @@ someval
         // but we don't want that function to do anything useful
         // since, again, the benchmark should be of the
         // interpreter's code.
-        fn ignore<'a>(_: Vec<Value<'a>>) -> Value<'static> {
+        fn ignore<'a>(_: Vec<&Value<'a>>) -> Value<'static> {
             Value::Void
         }
 
         let (program, _) = expr().easy_parse(MANY_VARIABLES).unwrap();
 
-        let mut env: HashMap<&str, Value> = HashMap::new();
+        let mut env = HashMap::new();
 
-        env.insert("ignore", Value::InbuiltFunc(ignore));
+        env.insert("ignore", Cow::Owned(Value::InbuiltFunc(ignore)));
 
         b.iter(|| black_box(eval(&program, &mut env)));
     }
