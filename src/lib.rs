@@ -36,13 +36,13 @@ impl PartialEq for Value {
     }
 }
 
-pub fn eval(program: Ast, variables: &mut HashMap<Rc<String>, Value>) -> Value {
+pub fn eval(program: Ast, variables: &mut HashMap<Rc<str>, Value>) -> Value {
     use self::Ast::*;
     use self::Value::*;
 
     match program {
         Lit(val) => val,
-        Variable(name) => match variables.get(&name) {
+        Variable(name) => match variables.get::<str>(name.as_ref()) {
             Some(v) => v.clone(),
             _ => panic!("Variable does not exist: {}", &name),
         },
@@ -61,7 +61,7 @@ pub fn eval(program: Ast, variables: &mut HashMap<Rc<String>, Value>) -> Value {
 
                     for (name, val) in args.into_iter().zip(arguments) {
                         let val = eval(val, variables);
-                        new_scope.insert(Rc::new(name), val);
+                        new_scope.insert(name.into(), val);
                     }
 
                     let mut out = Void;
@@ -84,7 +84,7 @@ pub fn eval(program: Ast, variables: &mut HashMap<Rc<String>, Value>) -> Value {
         Define(name, value) => {
             let value = eval(*value, variables);
 
-            variables.insert(Rc::new(name), value);
+            variables.insert(name.into(), value);
 
             Void
         }
@@ -352,8 +352,8 @@ someval
             Value::InbuiltFunc(callable)
         }
 
-        let mut env = HashMap::new();
-        env.insert(Rc::new("test".to_owned()), Value::InbuiltFunc(callable));
+        let mut env: HashMap<Rc<str>, Value> = HashMap::new();
+        env.insert("test".into(), Value::InbuiltFunc(callable));
 
         let (program, _) = expr().easy_parse(DEEP_NESTING).unwrap();
 
@@ -364,11 +364,11 @@ someval
     fn run_real_code(b: &mut Bencher) {
         use std::collections::HashMap;
 
-        let mut env: HashMap<Rc<String>, Value> = HashMap::new();
+        let mut env: HashMap<Rc<str>, Value> = HashMap::new();
 
-        env.insert(Rc::new("eq".to_owned()), Value::InbuiltFunc(eq));
-        env.insert(Rc::new("add".to_owned()), Value::InbuiltFunc(add));
-        env.insert(Rc::new("if".to_owned()), Value::InbuiltFunc(if_));
+        env.insert("eq".into(), Value::InbuiltFunc(eq));
+        env.insert("add".into(), Value::InbuiltFunc(add));
+        env.insert("if".into(), Value::InbuiltFunc(if_));
 
         let (program, _) = ::combine::many1::<Vec<_>, _>(expr())
             .easy_parse(REAL_CODE)
@@ -397,9 +397,9 @@ someval
 
         let (program, _) = expr().easy_parse(MANY_VARIABLES).unwrap();
 
-        let mut env = HashMap::new();
+        let mut env: HashMap<Rc<str>, Value> = HashMap::new();
 
-        env.insert(Rc::new("ignore".to_owned()), Value::InbuiltFunc(ignore));
+        env.insert("ignore".into(), Value::InbuiltFunc(ignore));
 
         b.iter(|| black_box(eval(program.clone(), &mut env)));
     }
