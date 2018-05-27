@@ -2,8 +2,10 @@
 
 #[macro_use]
 extern crate combine;
+extern crate fnv;
 
-use std::collections::HashMap;
+use fnv::FnvHashMap as HashMap;
+//use std::collections::HashMap;
 use std::borrow::Cow;
 use std::rc::Rc;
 
@@ -145,6 +147,7 @@ mod benches {
     extern crate test;
 
     use combine::Parser;
+    use fnv::FnvHashMap as HashMap;
 
     use self::test::{black_box, Bencher};
 
