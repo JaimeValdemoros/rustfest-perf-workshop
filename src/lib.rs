@@ -2,31 +2,41 @@
 
 #[macro_use]
 extern crate combine;
-extern crate fnv;
+extern crate intmap;
 
-use fnv::FnvHashMap as HashMap;
-//use std::collections::HashMap;
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::rc::Rc;
+use std::borrow::Borrow;
 
 #[derive(Clone)]
-pub enum Ast<'a> {
-    Lit(Value<'a>),
-    Variable(&'a str),
-    Call(Box<Ast<'a>>, Vec<Ast<'a>>),
-    Define(&'a str, Box<Ast<'a>>),
+pub enum Ast<Ident> {
+    Lit(Value<Ident>),
+    Variable(Ident),
+    Call(Box<Ast<Ident>>, Vec<Ast<Ident>>),
+    Define(Ident, Box<Ast<Ident>>),
 }
 
 #[derive(Clone)]
-pub enum Value<'a> {
+pub enum Value<Ident> {
     Void,
     False,
     Int(u64),
-    Function(Rc<[&'a str]>, Rc<[Ast<'a>]>),
-    InbuiltFunc(fn(&[&Value<'a>]) -> Value<'a>),
+    Function(Rc<[Ident]>, Rc<[Ast<Ident>]>),
+    InbuiltFunc(fn(&[&Value<Ident>]) -> Value<Ident>),
 }
 
-impl<'a> PartialEq for Value<'a> {
+fn hash_string(x: &str) -> u64 {
+    use ::std::collections::hash_map::DefaultHasher;
+    use ::std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    x.hash(&mut h);
+    h.finish()
+}
+
+impl<Id> PartialEq for Value<Id> {
     fn eq(&self, other: &Self) -> bool {
         use Value::*;
 
@@ -39,15 +49,22 @@ impl<'a> PartialEq for Value<'a> {
     }
 }
 
-pub fn eval<'a, 'b>(program: &'b Ast<'a>, variables: &mut HashMap<&'a str, Cow<'b, Value<'a>>>) -> Cow<'b, Value<'a>> {
+pub trait Map<K, V> {
+    fn get<Q: ?Sized>(&self, k: &Q) -> Option<&V> where
+        K: Borrow<Q>,
+        Q: Hash + Eq;
+    fn insert(&mut self, k: K, v: V);
+}
+
+pub fn eval<'b, Id: Clone + Debug + Eq + Hash>(program: &'b Ast<Id>, variables: &mut HashMap<Id, Cow<'b, Value<Id>>>) -> Cow<'b, Value<Id>> {
     use self::Ast::*;
     use self::Value::*;
 
     match *program {
         Lit(ref val) => Cow::Borrowed(val),
-        Variable(ref name) => match variables.get::<str>(name.as_ref()) {
+        Variable(ref name) => match variables.get(name) {
             Some(v) => v.clone(),
-            _ => panic!("Variable does not exist: {}", &name),
+            _ => panic!("Variable does not exist: {:?}", name),
         },
         Call(ref func, ref arguments) => {
             let func = eval(&*func, variables);
@@ -64,7 +81,7 @@ pub fn eval<'a, 'b>(program: &'b Ast<'a>, variables: &mut HashMap<&'a str, Cow<'
 
                     for (name, val) in args.into_iter().zip(arguments) {
                         let val = eval(&val, variables);
-                        new_scope.insert(name, val);
+                        new_scope.insert(name.clone(), val);
                     }
 
                     let mut out = Cow::Owned(Void);
@@ -93,7 +110,7 @@ pub fn eval<'a, 'b>(program: &'b Ast<'a>, variables: &mut HashMap<&'a str, Cow<'
         Define(ref name, ref value) => {
             let value = eval(&*value, variables);
 
-            variables.insert(name, value);
+            variables.insert(name.clone(), value);
 
             Cow::Owned(Void)
         }
@@ -101,9 +118,9 @@ pub fn eval<'a, 'b>(program: &'b Ast<'a>, variables: &mut HashMap<&'a str, Cow<'
 }
 
 parser! {
-    pub fn expr['a, I]()(I) -> Ast<'a> where [
-        I: combine::Stream<Item = char, Range = &'a str> +
-        combine::RangeStreamOnce
+    pub fn expr['a, I]()(I) -> Ast<u64> where [
+         I: combine::Stream<Item = char, Range = &'a str> +
+         combine::RangeStreamOnce
     ] {
         use combine::parser::char::*;
         use combine::parser::range::*;
@@ -122,7 +139,7 @@ parser! {
         let lambda = char('\\');
         let eq = char('=');
         let flse = white!(string("#f")).map(|_| Ast::Lit(::Value::False));
-        let ident = || white!(take_while1(|c: char| c.is_alphabetic()));
+        let ident = || white!(take_while1(|c: char| c.is_alphabetic())).map(hash_string);
         let function = (
             white!(lambda),
             white!(between(char('('), char(')'), many::<Vec<_>, _>(ident()))),
@@ -147,20 +164,20 @@ mod benches {
     extern crate test;
 
     use combine::Parser;
-    use fxhash::FxHashMap as HashMap;
 
     use self::test::{black_box, Bencher};
 
-    use super::{eval, expr, Value};
+    use super::{eval, expr, hash_string, Value};
 
     use std::borrow::Cow;
+    use std::collections::HashMap;
 
     // First we need some helper functions. These are used with the `InbuiltFunc`
     // constructor and act as native functions, similar to how you'd add functions
     // to the global namespace in Lua.
     //
     // This one simply sums the arguments.
-    fn add<'a>(variables: &[&Value<'a>]) -> Value<'a> {
+    fn add<T>(variables: &[&Value<T>]) -> Value<T> {
         let mut out = 0u64;
 
         for v in variables {
@@ -176,7 +193,7 @@ mod benches {
     // This one checks the arguments for equality. I used `Void` to represent true
     // and `False` to represent false. This is mostly inspired by scheme, where
     // everything is true except for `#f`.
-    fn eq<'a>(variables: &[&Value<'a>]) -> Value<'a> {
+    fn eq<T>(variables: &[&Value<T>]) -> Value<T> {
         let mut iter_vars = variables.into_iter();
         if let Some(last) = iter_vars.next() {
             for v in iter_vars {
@@ -195,7 +212,7 @@ mod benches {
     // other programming language in existence. To do lazy evaluation you make
     // the `then` and `else` branches return functions and then call the
     // functions.
-    fn if_<'a>(variables: &[&Value<'a>]) -> Value<'a> {
+    fn if_<T: Clone>(variables: &[&Value<T>]) -> Value<T> {
         use std::ops::Deref;
 
         let mut iter = variables.into_iter();
@@ -364,14 +381,14 @@ someval
         // it just returns itself. We try to do as little work as
         // possible here so that our benchmark is still testing the
         // interpreter and not this function.
-        fn callable<'a>(_: &[&Value<'a>]) -> Value<'a> {
+        fn callable<T>(_: &[&Value<T>]) -> Value<T> {
             Value::InbuiltFunc(callable)
         }
 
         let (program, _) = expr().easy_parse(DEEP_NESTING).unwrap();
 
         let mut env = HashMap::default();
-        env.insert("test".into(), Cow::Owned(Value::InbuiltFunc(callable)));
+        env.insert(hash_string("test"), Cow::Owned(Value::InbuiltFunc(callable)));
 
         b.iter(|| {
             black_box(eval(&program, &mut env))
@@ -383,9 +400,9 @@ someval
 
         let mut env = HashMap::default();
 
-        env.insert("eq".into(), Cow::Owned(Value::InbuiltFunc(eq)));
-        env.insert("add".into(), Cow::Owned(Value::InbuiltFunc(add)));
-        env.insert("if".into(), Cow::Owned(Value::InbuiltFunc(if_)));
+        env.insert(hash_string("eq"), Cow::Owned(Value::InbuiltFunc(eq)));
+        env.insert(hash_string("add"), Cow::Owned(Value::InbuiltFunc(add)));
+        env.insert(hash_string("if"), Cow::Owned(Value::InbuiltFunc(if_)));
 
         let (program, _) = ::combine::many1::<Vec<_>, _>(expr())
             .easy_parse(REAL_CODE)
@@ -407,7 +424,7 @@ someval
         // but we don't want that function to do anything useful
         // since, again, the benchmark should be of the
         // interpreter's code.
-        fn ignore<'a>(_: &[&Value<'a>]) -> Value<'static> {
+        fn ignore<T>(_: &[&Value<T>]) -> Value<T> {
             Value::Void
         }
 
@@ -415,7 +432,7 @@ someval
 
         let mut env = HashMap::default();
 
-        env.insert("ignore", Cow::Owned(Value::InbuiltFunc(ignore)));
+        env.insert(hash_string("ignore"), Cow::Owned(Value::InbuiltFunc(ignore)));
 
         b.iter(|| black_box(eval(&program, &mut env)));
     }
