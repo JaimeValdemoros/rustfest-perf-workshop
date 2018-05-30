@@ -7,9 +7,8 @@ extern crate intmap;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::rc::Rc;
-use std::borrow::Borrow;
 
 #[derive(Clone)]
 pub enum Ast<Ident> {
@@ -29,8 +28,7 @@ pub enum Value<Ident> {
 }
 
 fn hash_string(x: &str) -> u64 {
-    use ::std::collections::hash_map::DefaultHasher;
-    use ::std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
     let mut h = DefaultHasher::new();
     x.hash(&mut h);
     h.finish()
@@ -49,23 +47,21 @@ impl<Id> PartialEq for Value<Id> {
     }
 }
 
-pub trait Map<K, V> {
-    fn get<Q: ?Sized>(&self, k: &Q) -> Option<&V> where
-        K: Borrow<Q>,
-        Q: Hash + Eq;
-    fn insert(&mut self, k: K, v: V);
-}
-
-pub fn eval<'b, Id: Clone + Debug + Eq + Hash>(program: &'b Ast<Id>, variables: &mut HashMap<Id, Cow<'b, Value<Id>>>) -> Cow<'b, Value<Id>> {
+pub fn eval<'b, Id: Clone + Debug + Eq + Hash, S: BuildHasher + Clone>(
+    program: &'b Ast<Id>,
+    variables: &mut HashMap<Id, Cow<'b, Value<Id>>, S>,
+) -> Cow<'b, Value<Id>> {
     use self::Ast::*;
     use self::Value::*;
 
     match *program {
         Lit(ref val) => Cow::Borrowed(val),
-        Variable(ref name) => match variables.get(name) {
-            Some(v) => v.clone(),
-            _ => panic!("Variable does not exist: {:?}", name),
-        },
+        Variable(ref name) => {
+            match variables.get(name) {
+                Some(v) => v.clone(),
+                _ => panic!("Variable does not exist: {:?}", name),
+            }
+        }
         Call(ref func, ref arguments) => {
             let func = eval(&*func, variables);
 
@@ -76,7 +72,12 @@ pub fn eval<'b, Id: Clone + Debug + Eq + Hash>(program: &'b Ast<Id>, variables: 
                     let mut new_scope = variables.clone();
 
                     if arguments.len() != args.len() {
-                        println!("Called function with incorrect number of arguments (expected {}, got {})", args.len(), arguments.len());
+                        println!(
+                            "Called function with incorrect number of arguments (expected {}, got \
+                            {})",
+                            args.len(),
+                            arguments.len()
+                        );
                     }
 
                     for (name, val) in args.into_iter().zip(arguments) {
@@ -94,16 +95,16 @@ pub fn eval<'b, Id: Clone + Debug + Eq + Hash>(program: &'b Ast<Id>, variables: 
                 }
                 InbuiltFunc(ref func) => {
                     let args = arguments
-                            .iter()
-                            .map(|ast| eval(ast, variables))
-                            .collect::<Vec<_>>();
+                        .iter()
+                        .map(|ast| eval(ast, variables))
+                        .collect::<Vec<_>>();
 
                     let arg_refs = args.iter().map(|v| v.as_ref()).collect::<Vec<_>>();
 
                     let res = func(&arg_refs);
 
                     Cow::Owned(res)
-                },
+                }
                 _ => panic!("Attempted to call a non-function"),
             }
         }
@@ -116,6 +117,32 @@ pub fn eval<'b, Id: Clone + Debug + Eq + Hash>(program: &'b Ast<Id>, variables: 
         }
     }
 }
+
+#[derive(Clone, Default)]
+struct U64Hasher(pub u64);
+
+impl BuildHasher for U64Hasher {
+    type Hasher = Self;
+    fn build_hasher(&self) -> Self {
+        U64Hasher(self.0)
+    }
+}
+
+impl Hasher for U64Hasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _bytes: &[u8]) {
+        unimplemented!()
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i
+    }
+}
+
+type IntMap<V> = HashMap<u64, V, U64Hasher>;
 
 parser! {
     pub fn expr['a, I]()(I) -> Ast<u64> where [
@@ -167,10 +194,9 @@ mod benches {
 
     use self::test::{black_box, Bencher};
 
-    use super::{eval, expr, hash_string, Value};
+    use super::{eval, expr, hash_string, IntMap, Value};
 
     use std::borrow::Cow;
-    use std::collections::HashMap;
 
     // First we need some helper functions. These are used with the `InbuiltFunc`
     // constructor and act as native functions, similar to how you'd add functions
@@ -235,7 +261,8 @@ mod benches {
     // This string is used to test the performance when programs include
     // deeply-nested structures. Nesting this deep is unlikely but it's a
     // good test for the parser's performance on nesting in general.
-    const DEEP_NESTING: &str = "(((((((((((((((((((((((((((((((((((((((((((((test)))))))))))))))))))))))))))))))))))))))))))))";
+    const DEEP_NESTING: &str = "(((((((((((((((((((((((((((((((((((((((((((((test\
+    )))))))))))))))))))))))))))))))))))))))))))))";
 
     // This string is used to test the performance of when programs include
     // many variables of many different names, and many repetitions of the
@@ -387,18 +414,19 @@ someval
 
         let (program, _) = expr().easy_parse(DEEP_NESTING).unwrap();
 
-        let mut env = HashMap::default();
-        env.insert(hash_string("test"), Cow::Owned(Value::InbuiltFunc(callable)));
+        let mut env = IntMap::default();
+        env.insert(
+            hash_string("test"),
+            Cow::Owned(Value::InbuiltFunc(callable)),
+        );
 
-        b.iter(|| {
-            black_box(eval(&program, &mut env))
-        });
+        b.iter(|| black_box(eval(&program, &mut env)));
     }
 
     #[bench]
     fn run_real_code(b: &mut Bencher) {
 
-        let mut env = HashMap::default();
+        let mut env = IntMap::default();
 
         env.insert(hash_string("eq"), Cow::Owned(Value::InbuiltFunc(eq)));
         env.insert(hash_string("add"), Cow::Owned(Value::InbuiltFunc(add)));
@@ -430,9 +458,12 @@ someval
 
         let (program, _) = expr().easy_parse(MANY_VARIABLES).unwrap();
 
-        let mut env = HashMap::default();
+        let mut env = IntMap::default();
 
-        env.insert(hash_string("ignore"), Cow::Owned(Value::InbuiltFunc(ignore)));
+        env.insert(
+            hash_string("ignore"),
+            Cow::Owned(Value::InbuiltFunc(ignore)),
+        );
 
         b.iter(|| black_box(eval(&program, &mut env)));
     }
@@ -441,7 +472,7 @@ someval
     fn run_nested_func(b: &mut Bencher) {
 
         let (program, _) = expr().easy_parse(NESTED_FUNC).unwrap();
-        let mut env = HashMap::default();
+        let mut env = IntMap::default();
         b.iter(|| black_box(eval(&program, &mut env)));
     }
 }
